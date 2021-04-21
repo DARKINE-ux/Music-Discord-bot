@@ -1,129 +1,82 @@
-const Discord = require("discord.js");
-const { prefix, token } = require("./config.json");
-const ytdl = require("ytdl-core");
+const DisTube = require("distube")
+const Discord = require("discord.js")
+const client = new Discord.Client()
+const fs = require("fs")
+const config = require("./config.json")
+const express = require("express");
 
-const client = new Discord.Client();
-
-const queue = new Map();
-
-client.once("ready", () => {
-  console.log("Ready!");
+const app = express();
+app.get("/", (request, response) => {
+  const ping = new Date();
+  ping.setHours(ping.getHours() - 3);
+  console.log(`Ping recebido às ${ping.getUTCHours()}:${ping.getUTCMinutes()}:${ping.getUTCSeconds()}`);
+  response.sendStatus(200);
 });
+app.listen(process.env.PORT); // Recebe solicitações que o deixa online
 
-client.once("reconnecting", () => {
-  console.log("Reconnecting!");
-});
+client.config = require("./config.json")
+client.distube = new DisTube(client, { searchSongs: true, emitNewSongOnly: true, leaveOnFinish: true })
+client.commands = new Discord.Collection()
+client.aliases = new Discord.Collection()
+client.emotes = config.emoji
 
-client.once("disconnect", () => {
-  console.log("Disconnect!");
-});
+fs.readdir("./commands/", (err, files) => {
+    if (err) return console.log("Não foi possível encontrar nenhum comando!")
+    const jsFiles = files.filter(f => f.split(".").pop() === "js")
+    if (jsFiles.length <= 0) return console.log("Não foi possível encontrar nenhum comando!")
+    jsFiles.forEach(file => {
+        const cmd = require(`./commands/${file}`)
+        console.log(`Carregado ${file}`)
+        client.commands.set(cmd.name, cmd)
+        if (cmd.aliases) cmd.aliases.forEach(alias => client.aliases.set(alias, cmd.name))
+    })
+})
+
+client.on("ready", () => {
+    console.log(`${client.user.tag} está pronto para tocar música.`)
+    const server = client.voice.connections.size
+})
 
 client.on("message", async message => {
-  if (message.author.bot) return;
-  if (!message.content.startsWith(prefix)) return;
-
-  const serverQueue = queue.get(message.guild.id);
-
-  if (message.content.startsWith(`${prefix}play`)) {
-    execute(message, serverQueue);
-    return;
-  } else if (message.content.startsWith(`${prefix}skip`)) {
-    skip(message, serverQueue);
-    return;
-  } else if (message.content.startsWith(`${prefix}stop`)) {
-    stop(message, serverQueue);
-    return;
-  } else {
-    message.channel.send("You need to enter a valid command!");
-  }
-});
-
-async function execute(message, serverQueue) {
-  const args = message.content.split(" ");
-
-  const voiceChannel = message.member.voice.channel;
-  if (!voiceChannel)
-    return message.channel.send(
-      "You need to be in a voice channel to play music!"
-    );
-  const permissions = voiceChannel.permissionsFor(message.client.user);
-  if (!permissions.has("CONNECT") || !permissions.has("SPEAK")) {
-    return message.channel.send(
-      "I need the permissions to join and speak in your voice channel!"
-    );
-  }
-
-  const songInfo = await ytdl.getInfo(args[1]);
-  const song = {
-        title: songInfo.videoDetails.title,
-        url: songInfo.videoDetails.video_url,
-   };
-
-  if (!serverQueue) {
-    const queueContruct = {
-      textChannel: message.channel,
-      voiceChannel: voiceChannel,
-      connection: null,
-      songs: [],
-      volume: 5,
-      playing: true
-    };
-
-    queue.set(message.guild.id, queueContruct);
-
-    queueContruct.songs.push(song);
-
+    const prefix = config.prefix
+    if (!message.content.startsWith(prefix)) return
+    const args = message.content.slice(prefix.length).trim().split(/ +/g)
+    const command = args.shift().toLowerCase()
+    const cmd = client.commands.get(command) || client.commands.get(client.aliases.get(command))
+    if (!cmd) return
+    if (cmd.inVoiceChannel && !message.member.voice.channel) return message.channel.send(`${client.emotes.error} **Entre em um canal de voz para poder utilizar o comando!**`)
     try {
-      var connection = await voiceChannel.join();
-      queueContruct.connection = connection;
-      play(message.guild, queueContruct.songs[0]);
-    } catch (err) {
-      console.log(err);
-      queue.delete(message.guild.id);
-      return message.channel.send(err);
+        cmd.run(client, message, args)
+    } catch (e) {
+        console.error(e)
+        message.reply(`Error: ${e}`)
     }
-  } else {
-    serverQueue.songs.push(song);
-    return message.channel.send(`${song.title} has been added to the queue!`);
-  }
-}
+})
 
-function skip(message, serverQueue) {
-  if (!message.member.voice.channel)
-    return message.channel.send(
-      "You have to be in a voice channel to stop the music!"
-    );
-  if (!serverQueue)
-    return message.channel.send("There is no song that I could skip!");
-  serverQueue.connection.dispatcher.end();
-}
-
-function stop(message, serverQueue) {
-  if (!message.member.voice.channel)
-    return message.channel.send(
-      "You have to be in a voice channel to stop the music!"
-    );
-  serverQueue.songs = [];
-  serverQueue.connection.dispatcher.end();
-}
-
-function play(guild, song) {
-  const serverQueue = queue.get(guild.id);
-  if (!song) {
-    serverQueue.voiceChannel.leave();
-    queue.delete(guild.id);
-    return;
-  }
-
-  const dispatcher = serverQueue.connection
-    .play(ytdl(song.url))
-    .on("finish", () => {
-      serverQueue.songs.shift();
-      play(guild, serverQueue.songs[0]);
+const status = queue => `Volume: \`${queue.volume}%\` | Filtro: \`${queue.filter || "Off"}\` | Loop: \`${queue.repeatMode ? queue.repeatMode === 2 ? "Toda a fila" : "Essa musica" : "Off"}\` | Autoplay: \`${queue.autoplay ? "On" : "Off"}\``
+client.distube
+    .on("playSong", (message, queue, song) => message.channel.send(
+        `${client.emotes.play} | Tocando \`${song.name}\` - \`${song.formattedDuration}\`\nRequerido por: ${song.user}\n${status(queue)}`
+    ))
+    .on("addSong", (message, queue, song) => message.channel.send(
+        `${client.emotes.success} | Adicionado ${song.name} - \`${song.formattedDuration}\` para a fila por ${song.user}`
+    ))
+    .on("playList", (message, queue, playlist, song) => message.channel.send(
+        `${client.emotes.play} | Tocar \`${playlist.title}\` playlist (${playlist.total_items} Musicas).\nRequerido por: ${song.user}\nTocando agora \`${song.name}\` - \`${song.formattedDuration}\`\n${status(queue)}`
+    ))
+    .on("addList", (message, queue, playlist) => message.channel.send(
+        `${client.emotes.success} | Adicionado \`${playlist.title}\` playlist (${playlist.total_items} Musicas) enfileirar\n${status(queue)}`
+    ))
+    // DisTubeOptions.searchSongs = true
+    .on("searchResult", (message, result) => {
+        let i = 0;
+        const Re = new Discord.MessageEmbed()
+        .setDescription(`**Escolha uma opção abaixo**\n${result.map(song => `**${++i}**. ${song.name} - \`${song.formattedDuration}\``).join("\n")}\n*Digite qualquer outra coisa ou aguarde 60 segundos para cancelar*`)
+        .setColor("BLUE")
+        message.channel.send(Re)
     })
-    .on("error", error => console.error(error));
-  dispatcher.setVolumeLogarithmic(serverQueue.volume / 5);
-  serverQueue.textChannel.send(`Start playing: **${song.title}**`);
-}
+    // DisTubeOptions.searchSongs = true
+    .on("searchCancel", message => message.channel.send(`${client.emotes.error} **Pesquisa cancelada**`))
+    .on("error", (message, err) => message.channel.send(`${client.emotes.error} **Um erro encontrado:** ${err}`))
 
-client.login(token);
+client.login(config.token)
